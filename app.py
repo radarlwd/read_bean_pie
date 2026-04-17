@@ -18,7 +18,8 @@ DATA_DIR = Path("data")
 JOBS_DIR = DATA_DIR / "jobs"
 JOBS_INDEX_FILE = DATA_DIR / "jobs_index.json"
 DB_CONNECTIONS_FILE = DATA_DIR / "db_connections.json"
-QUERY_VAR_PATTERN = re.compile(r"\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}")
+QUERY_PLACEHOLDER_PATTERN = re.compile(r"\{\{\s*([A-Za-z_][A-Za-z0-9_\.]*)\s*\}\}")
+VARIABLE_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 def utc_now_iso() -> str:
@@ -53,6 +54,68 @@ def parse_query_variables(raw_text: str) -> tuple[dict[str, Any] | None, str | N
     return parsed, None
 
 
+def rows_to_dicts(headers: list[str], rows: list[tuple[Any, ...]]) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for row in rows:
+        record: dict[str, Any] = {}
+        for idx, header in enumerate(headers):
+            record[header] = row[idx] if idx < len(row) else None
+        records.append(record)
+    return records
+
+
+def get_value_by_path(data: dict[str, Any], path: str) -> tuple[bool, Any]:
+    current: Any = data
+    for part in path.split("."):
+        if isinstance(current, dict) and part in current:
+            current = current[part]
+        else:
+            return False, None
+    return True, current
+
+
+def parse_query_block(raw_query: str, query_index: int) -> dict[str, Any]:
+    lines = raw_query.splitlines()
+    name = f"q{query_index}"
+    for_each: str | None = None
+    item_alias = "item"
+    body_start = 0
+
+    for idx, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped:
+            body_start = idx + 1
+            continue
+
+        if not stripped.startswith("-- @"):
+            body_start = idx
+            break
+
+        directive = stripped[4:].strip()
+        if directive.startswith("name "):
+            value = directive[5:].strip()
+            if value:
+                name = value
+        elif directive.startswith("for_each "):
+            value = directive[9:].strip()
+            if value:
+                for_each = value
+        elif directive.startswith("item "):
+            value = directive[5:].strip()
+            if value:
+                item_alias = value
+        body_start = idx + 1
+
+    sql_text = "\n".join(lines[body_start:]).strip()
+    return {
+        "name": name,
+        "for_each": for_each,
+        "item_alias": item_alias,
+        "sql": sql_text,
+        "raw": raw_query,
+    }
+
+
 def parse_variable_value(raw_value: str) -> Any:
     value = raw_value.strip()
     if value == "":
@@ -67,8 +130,11 @@ def parse_variable_value(raw_value: str) -> Any:
 def extract_query_variables(queries: list[str]) -> list[str]:
     names: set[str] = set()
     for query in queries:
-        for match in QUERY_VAR_PATTERN.finditer(query):
-            names.add(match.group(1))
+        parsed = parse_query_block(query, 1)
+        for match in QUERY_PLACEHOLDER_PATTERN.finditer(parsed["sql"]):
+            variable_path = match.group(1)
+            if "." not in variable_path:
+                names.add(variable_path)
     return sorted(names)
 
 
@@ -77,16 +143,17 @@ def compile_query_template(query: str, variables: dict[str, Any]) -> tuple[str, 
     missing: list[str] = []
 
     def replace(match: re.Match[str]) -> str:
-        name = match.group(1)
-        if name not in variables:
-            if name not in missing:
-                missing.append(name)
+        variable_path = match.group(1)
+        found, value = get_value_by_path(variables, variable_path)
+        if not found:
+            if variable_path not in missing:
+                missing.append(variable_path)
             return match.group(0)
 
-        params.append(variables[name])
+        params.append(value)
         return "?"
 
-    compiled_query = QUERY_VAR_PATTERN.sub(replace, query)
+    compiled_query = QUERY_PLACEHOLDER_PATTERN.sub(replace, query)
     return compiled_query, params, missing
 
 
@@ -257,41 +324,122 @@ def run_job(
     conn_str = build_connection_string(server, port, database, username, password)
 
     results: list[dict[str, Any]] = []
+    query_specs = [parse_query_block(query, i) for i, query in enumerate(queries, start=1)]
+
+    seen_names: set[str] = set()
+    for spec in query_specs:
+        name = spec["name"]
+        if not VARIABLE_NAME_PATTERN.fullmatch(name):
+            raise ValueError(
+                f"Invalid query name '{name}'. Use letters, numbers, and underscores only."
+            )
+        if name in seen_names:
+            raise ValueError(f"Duplicate query name: {name}")
+        seen_names.add(name)
+
+    context: dict[str, Any] = dict(query_variables)
+    context["results"] = {}
+
     with pyodbc.connect(conn_str, timeout=60) as connection:
         cursor = connection.cursor()
 
-        for i, query in enumerate(queries, start=1):
-            compiled_query, params, missing_vars = compile_query_template(query, query_variables)
+        for i, spec in enumerate(query_specs, start=1):
             result: dict[str, Any] = {
                 "query_index": i,
-                "query": query,
-                "compiled_query": compiled_query,
-                "parameters": params,
+                "query_name": spec["name"],
+                "query": spec["raw"],
+                "compiled_query": None,
+                "parameters": [],
+                "for_each": spec["for_each"],
+                "item_alias": spec["item_alias"],
                 "status": "success",
                 "row_count": 0,
                 "column_headers": [],
                 "output_file": None,
                 "error": None,
             }
+
+            if not spec["sql"]:
+                result["status"] = "error"
+                result["error"] = "Query block is empty after directives."
+                results.append(result)
+                continue
+
             try:
-                if missing_vars:
-                    raise ValueError(
-                        "Missing variable values for: " + ", ".join(missing_vars)
-                    )
+                headers: list[str] = []
+                all_rows: list[tuple[Any, ...]] = []
 
-                if params:
-                    cursor.execute(compiled_query, params)
+                if spec["for_each"]:
+                    found, iterable = get_value_by_path(context, spec["for_each"])
+                    if not found:
+                        raise ValueError(
+                            f"for_each source not found: {spec['for_each']}"
+                        )
+                    if not isinstance(iterable, list):
+                        raise ValueError(
+                            f"for_each source must be an array/list: {spec['for_each']}"
+                        )
+
+                    for item in iterable:
+                        loop_context = dict(context)
+                        loop_context[spec["item_alias"]] = item
+                        compiled_query, params, missing_vars = compile_query_template(
+                            spec["sql"], loop_context
+                        )
+                        if missing_vars:
+                            raise ValueError(
+                                "Missing variable values for: " + ", ".join(missing_vars)
+                            )
+
+                        result["compiled_query"] = compiled_query
+                        result["parameters"].append(params)
+
+                        if params:
+                            cursor.execute(compiled_query, params)
+                        else:
+                            cursor.execute(compiled_query)
+
+                        if cursor.description:
+                            current_headers = [column[0] for column in cursor.description]
+                            if not headers:
+                                headers = current_headers
+                            rows = cursor.fetchall()
+                            all_rows.extend(rows)
                 else:
-                    cursor.execute(compiled_query)
-                if cursor.description:
-                    headers = [column[0] for column in cursor.description]
-                    rows = cursor.fetchall()
-                    output_file = job_dir / f"query_{i}.csv"
-                    write_csv(output_file, headers, rows)
+                    compiled_query, params, missing_vars = compile_query_template(spec["sql"], context)
+                    if missing_vars:
+                        raise ValueError(
+                            "Missing variable values for: " + ", ".join(missing_vars)
+                        )
 
-                    result["row_count"] = len(rows)
+                    result["compiled_query"] = compiled_query
+                    result["parameters"] = params
+
+                    if params:
+                        cursor.execute(compiled_query, params)
+                    else:
+                        cursor.execute(compiled_query)
+
+                    if cursor.description:
+                        headers = [column[0] for column in cursor.description]
+                        rows = cursor.fetchall()
+                        all_rows.extend(rows)
+
+                if headers:
+                    output_file = job_dir / f"query_{i}.csv"
+                    write_csv(output_file, headers, all_rows)
+
+                    result["row_count"] = len(all_rows)
                     result["column_headers"] = headers
                     result["output_file"] = str(output_file)
+
+                    records = rows_to_dicts(headers, all_rows)
+                    context["results"][spec["name"]] = records
+                    context[spec["name"]] = {
+                        "rows": records,
+                        "first": records[0] if records else {},
+                        "count": len(records),
+                    }
                 else:
                     result["status"] = "no_result_set"
                     result["row_count"] = cursor.rowcount if cursor.rowcount != -1 else 0
@@ -395,15 +543,21 @@ def render_create_job_tab() -> None:
     with st.popover("Help"):
         st.markdown("### Example Usage")
         st.markdown("Use placeholders in SQL with the format `{{variable_name}}`.")
+        st.markdown(
+            "Add optional directives at the top of each query block: `-- @name`, `-- @for_each`, `-- @item`."
+        )
         st.code(
-            """SELECT TOP 10 OrderId, TenantId, OrderDate
-FROM dbo.Orders
-WHERE TenantId = {{tenant_id}}
-  AND OrderDate >= {{start_date}};
+            """-- @name users
+SELECT UserId, Region
+FROM dbo.Users
+WHERE TenantId = {{tenant_id}};
 ---
-SELECT COUNT(*) AS TotalOrders
+-- @name orders_by_user
+-- @for_each users.rows
+-- @item user
+SELECT OrderId, UserId, Amount
 FROM dbo.Orders
-WHERE TenantId = {{tenant_id}};""",
+WHERE UserId = {{user.UserId}};""",
             language="sql",
         )
         st.markdown("Provide values in **Query Variables (JSON)**:")
@@ -415,7 +569,7 @@ WHERE TenantId = {{tenant_id}};""",
             language="json",
         )
         st.caption(
-            "Tip: Do not wrap placeholders in quotes. Example: OrderDate >= {{start_date}}"
+            "Tip: `users.rows` is an array of objects from query `users`; each loop run appends to one combined result table."
         )
 
     if "query_variables_builder" not in st.session_state:
@@ -477,7 +631,7 @@ WHERE TenantId = {{tenant_id}};""",
             name = builder_variable_name.strip()
             if not name:
                 st.error("Variable Name is required.")
-            elif not QUERY_VAR_PATTERN.fullmatch(f"{{{{{name}}}}}"):
+            elif not VARIABLE_NAME_PATTERN.fullmatch(name):
                 st.error(
                     "Variable Name must use letters, numbers, and underscores, and cannot start with a number."
                 )
