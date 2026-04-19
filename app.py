@@ -585,6 +585,32 @@ def rows_to_records(headers: list[str], rows: list[list[str]]) -> list[dict[str,
     return records
 
 
+def filter_rows_by_search(rows: list[list[str]], search_text: str) -> list[list[str]]:
+    query = search_text.strip().lower()
+    if not query:
+        return rows
+
+    filtered: list[list[str]] = []
+    for row in rows:
+        if any(query in str(cell).lower() for cell in row):
+            filtered.append(row)
+    return filtered
+
+
+def render_searchable_result_table(
+    headers: list[str],
+    rows: list[list[str]],
+    *,
+    key_prefix: str,
+    search_label: str,
+) -> None:
+    search_text = st.text_input(search_label, key=f"{key_prefix}_search")
+    filtered_rows = filter_rows_by_search(rows, search_text)
+
+    st.caption(f"Showing {len(filtered_rows)} of {len(rows)} rows")
+    st.dataframe(rows_to_records(headers, filtered_rows), use_container_width=True)
+
+
 def render_create_job_tab() -> None:
     st.subheader("Create Job")
     st.write(
@@ -998,7 +1024,12 @@ def render_view_results_tab() -> None:
                 csv_path = Path(output_file)
                 if csv_path.exists():
                     headers, rows = read_csv_preview(csv_path)
-                    st.dataframe(rows_to_records(headers, rows), use_container_width=True)
+                    render_searchable_result_table(
+                        headers,
+                        rows,
+                        key_prefix=f"query_{query_result['query_index']}",
+                        search_label="Search rows",
+                    )
 
                     st.download_button(
                         label=f"Download CSV for Query {query_result['query_index']}",
@@ -1033,7 +1064,15 @@ def render_view_results_tab() -> None:
 
                     if loop_file.exists():
                         headers, rows = read_csv_preview(loop_file)
-                        st.dataframe(rows_to_records(headers, rows), use_container_width=True)
+                        render_searchable_result_table(
+                            headers,
+                            rows,
+                            key_prefix=(
+                                f"query_{query_result['query_index']}_"
+                                f"run_{loop_output['run_index']}"
+                            ),
+                            search_label=f"Search rows (Run {loop_output['run_index']})",
+                        )
                         st.download_button(
                             label=f"Download CSV for Run {loop_output['run_index']}",
                             data=loop_file.read_bytes(),
