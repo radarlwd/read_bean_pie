@@ -1017,8 +1017,15 @@ def render_view_results_tab() -> None:
                     st.markdown(
                         f"**Run {loop_output['run_index']}** | Rows: {loop_output['row_count']}"
                     )
-                    st.write("Loop Item")
-                    st.json(loop_output.get("item"))
+                    show_loop_item = st.checkbox(
+                        "Show Loop Item",
+                        value=False,
+                        key=(
+                            f"show_loop_item_{query_result['query_index']}_{loop_output['run_index']}"
+                        ),
+                    )
+                    if show_loop_item:
+                        st.json(loop_output.get("item"))
 
                     if loop_output.get("parameters"):
                         st.write("Run Parameters")
