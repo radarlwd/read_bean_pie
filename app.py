@@ -338,6 +338,7 @@ def write_csv(file_path: Path, headers: list[str], rows: list[tuple[Any, ...]]) 
 
 def run_job(
     job_name: str,
+    connection_name: str,
     server: str,
     port: int,
     database: str,
@@ -505,6 +506,7 @@ def run_job(
         "job_name": job_name.strip(),
         "created_at": created_at,
         "azure_sql": {
+            "connection_name": connection_name.strip(),
             "server": server.strip(),
             "port": int(port),
             "database": database.strip(),
@@ -524,6 +526,7 @@ def run_job(
         {
             "job_id": job_id,
             "job_name": job_name.strip(),
+            "connection_name": connection_name.strip(),
             "created_at": created_at,
             "query_count": len(queries),
             "server": server.strip(),
@@ -664,9 +667,32 @@ WHERE UserId = {{user.UserId}};""",
 
     st.markdown("#### Load From Previous Run")
     previous_jobs = load_jobs_index()
+    saved_connections = load_db_connections()
+
+    def resolve_previous_run_connection_name(job: dict[str, Any]) -> str:
+        if job.get("connection_name"):
+            return str(job["connection_name"])
+
+        job_server = normalize_server_name(str(job.get("server", "")))
+        job_port = int(job.get("port", 1433))
+        job_database = str(job.get("database", "")).strip().lower()
+        matches = [
+            conn
+            for conn in saved_connections
+            if normalize_server_name(str(conn.get("server", ""))) == job_server
+            and int(conn.get("port", 1433)) == job_port
+            and str(conn.get("database", "")).strip().lower() == job_database
+        ]
+        if len(matches) == 1:
+            return str(matches[0].get("connection_name", "Unknown Connection"))
+        return "Unknown Connection"
+
     if previous_jobs:
         previous_job_options = {
-            f"{job['job_name']} | {job['created_at']} | {job['job_id']}": job["job_id"]
+            (
+                f"{job['job_name']} | Connection: {resolve_previous_run_connection_name(job)} | "
+                f"{job['created_at']} | {job['job_id']}"
+            ): job["job_id"]
             for job in previous_jobs
         }
         selected_previous_job_label = st.selectbox(
@@ -922,6 +948,7 @@ Possible causes to check:
         try:
             metadata = run_job(
                 job_name,
+                selected_connection["connection_name"],
                 server,
                 int(port),
                 database,
@@ -977,8 +1004,31 @@ def render_view_results_tab() -> None:
         st.info("No jobs created yet.")
         return
 
+    saved_connections = load_db_connections()
+
+    def resolve_connection_name(job: dict[str, Any]) -> str:
+        if job.get("connection_name"):
+            return str(job["connection_name"])
+
+        job_server = normalize_server_name(str(job.get("server", "")))
+        job_port = int(job.get("port", 1433))
+        job_database = str(job.get("database", "")).strip().lower()
+        matches = [
+            conn
+            for conn in saved_connections
+            if normalize_server_name(str(conn.get("server", ""))) == job_server
+            and int(conn.get("port", 1433)) == job_port
+            and str(conn.get("database", "")).strip().lower() == job_database
+        ]
+        if len(matches) == 1:
+            return str(matches[0].get("connection_name", "Unknown Connection"))
+        return "Unknown Connection"
+
     labels = {
-        f"{job['job_name']} | {job['created_at']} | {job['job_id']}": job["job_id"]
+        (
+            f"{job['job_name']} | Connection: {resolve_connection_name(job)} | "
+            f"{job['created_at']} | {job['job_id']}"
+        ): job["job_id"]
         for job in jobs
     }
     selected_label = st.selectbox("Select Job", options=list(labels.keys()))
