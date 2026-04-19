@@ -901,6 +901,21 @@ WHERE UserId = {{user.UserId}};""",
         check_clicked = st.form_submit_button("Check DB Connection")
         run_clicked = st.form_submit_button("Run Job")
 
+    last_created_job_id = st.session_state.get("last_created_job_id")
+    last_created_job_name = st.session_state.get("last_created_job_name")
+    last_success_count = st.session_state.get("last_created_success_count")
+    last_error_count = st.session_state.get("last_created_error_count")
+    if last_created_job_id and last_created_job_name is not None:
+        st.success(
+            f"Job created: {last_created_job_name} ({last_created_job_id}). "
+            f"Successful queries: {last_success_count}, errors: {last_error_count}."
+        )
+        if st.button("Go to View Results", key="go_to_view_results"):
+            st.session_state["view_selected_job_id"] = last_created_job_id
+            st.session_state["active_tab"] = "view"
+            st.session_state["view_results_mode"] = "Browse Results"
+            st.rerun()
+
     if not check_clicked and not run_clicked:
         return
 
@@ -989,10 +1004,11 @@ Possible causes to check:
             )
             success_count = len([r for r in metadata["results"] if r["status"] == "success"])
             error_count = len([r for r in metadata["results"] if r["status"] == "error"])
-            st.success(
-                f"Job created: {metadata['job_name']} ({metadata['job_id']}). "
-                f"Successful queries: {success_count}, errors: {error_count}."
-            )
+            st.session_state["last_created_job_id"] = metadata["job_id"]
+            st.session_state["last_created_job_name"] = metadata["job_name"]
+            st.session_state["last_created_success_count"] = success_count
+            st.session_state["last_created_error_count"] = error_count
+            st.rerun()
         except Exception as exc:  # pylint: disable=broad-exception-caught
             st.error(f"Job execution failed: {exc}")
 
@@ -1028,6 +1044,9 @@ Possible causes to check:
 
 def render_view_results_tab() -> None:
     st.subheader("View Job Results")
+    if st.session_state.get("active_tab") == "view":
+        st.session_state["active_tab"] = "create"
+
     jobs = load_jobs_index()
 
     if not jobs:
@@ -1101,7 +1120,16 @@ def render_view_results_tab() -> None:
         return
 
     st.markdown("### Browse Results")
-    selected_label = st.selectbox("Select Job", options=list(labels.keys()))
+    options = list(labels.keys())
+    selected_index = 0
+    selected_job_id = st.session_state.pop("view_selected_job_id", None)
+    if selected_job_id:
+        for idx, option in enumerate(options):
+            if labels[option] == selected_job_id:
+                selected_index = idx
+                break
+
+    selected_label = st.selectbox("Select Job", options=options, index=selected_index)
     job_id = labels[selected_label]
 
     metadata = load_job_metadata(job_id)
@@ -1310,9 +1338,15 @@ def main() -> None:
         "Run and save outputs for multiple SQL queries per job using Azure SQL + Azure Active Directory Password authentication."
     )
 
-    create_tab, view_tab, connections_tab = st.tabs(
-        ["Create Job", "View Results", "DB Connections"]
-    )
+    active_tab = st.session_state.get("active_tab", "create")
+    if active_tab == "view":
+        view_tab, create_tab, connections_tab = st.tabs(
+            ["View Results", "Create Job", "DB Connections"]
+        )
+    else:
+        create_tab, view_tab, connections_tab = st.tabs(
+            ["Create Job", "View Results", "DB Connections"]
+        )
 
     with create_tab:
         render_create_job_tab()
