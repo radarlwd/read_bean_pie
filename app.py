@@ -630,17 +630,58 @@ def filter_rows_by_search(rows: list[list[str]], search_text: str) -> list[list[
     return filtered
 
 
+def utc_string_to_local_display(value: str) -> str:
+    raw = value.strip()
+    if not raw:
+        return value
+
+    candidates = [raw]
+    if raw.endswith("Z"):
+        candidates.append(f"{raw[:-1]}+00:00")
+    if " " in raw and "T" not in raw:
+        candidates.append(raw.replace(" ", "T"))
+        if raw.endswith("Z"):
+            candidates.append(f"{raw[:-1].replace(' ', 'T')}+00:00")
+
+    for candidate in candidates:
+        try:
+            parsed = datetime.fromisoformat(candidate)
+        except ValueError:
+            continue
+
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        elif parsed.utcoffset() != timezone.utc.utcoffset(None):
+            continue
+
+        return parsed.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+
+    return value
+
+
+def maybe_convert_utc_rows_to_local(rows: list[list[str]], convert_to_local: bool) -> list[list[str]]:
+    if not convert_to_local:
+        return rows
+
+    converted_rows: list[list[str]] = []
+    for row in rows:
+        converted_rows.append([utc_string_to_local_display(str(cell)) for cell in row])
+    return converted_rows
+
+
 def render_searchable_result_table(
     headers: list[str],
     rows: list[list[str]],
     *,
     key_prefix: str,
     search_label: str,
+    convert_utc_to_local: bool = False,
 ) -> None:
+    display_rows = maybe_convert_utc_rows_to_local(rows, convert_utc_to_local)
     search_text = st.text_input(search_label, key=f"{key_prefix}_search")
-    filtered_rows = filter_rows_by_search(rows, search_text)
+    filtered_rows = filter_rows_by_search(display_rows, search_text)
 
-    st.caption(f"Showing {len(filtered_rows)} of {len(rows)} rows")
+    st.caption(f"Showing {len(filtered_rows)} of {len(display_rows)} rows")
     st.dataframe(rows_to_records(headers, filtered_rows), use_container_width=True)
 
 
@@ -1044,6 +1085,12 @@ Possible causes to check:
 
 def render_view_results_tab() -> None:
     st.subheader("View Job Results")
+    convert_utc_to_local = st.checkbox(
+        "Display UTC timestamps as local time",
+        value=False,
+        key="view_convert_timestamps_local",
+        help="Display-only conversion. Saved job data and CSV files are unchanged.",
+    )
     jobs = load_jobs_index()
 
     if not jobs:
@@ -1135,7 +1182,7 @@ def render_view_results_tab() -> None:
         return
 
     st.write(f"**Job:** {metadata['job_name']}")
-    st.write(f"**Created (UTC):** {metadata['created_at']}")
+    st.write(f"**Created (Local):** {utc_string_to_local_display(str(metadata['created_at']))}")
     st.write(f"**Server:** {metadata['azure_sql']['server']}")
     st.write(f"**Port:** {metadata['azure_sql'].get('port', 1433)}")
     st.write(f"**Database:** {metadata['azure_sql']['database']}")
@@ -1174,6 +1221,7 @@ def render_view_results_tab() -> None:
                         rows,
                         key_prefix=f"query_{query_result['query_index']}",
                         search_label="Search rows",
+                        convert_utc_to_local=convert_utc_to_local,
                     )
 
                     st.download_button(
@@ -1217,6 +1265,7 @@ def render_view_results_tab() -> None:
                                 f"run_{loop_output['run_index']}"
                             ),
                             search_label=f"Search rows (Run {loop_output['run_index']})",
+                            convert_utc_to_local=convert_utc_to_local,
                         )
                         st.download_button(
                             label=f"Download CSV for Run {loop_output['run_index']}",
