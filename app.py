@@ -912,8 +912,8 @@ WHERE UserId = {{user.UserId}};""",
         )
         if st.button("Go to View Results", key="go_to_view_results"):
             st.session_state["view_selected_job_id"] = last_created_job_id
-            st.session_state["active_tab"] = "view"
             st.session_state["view_results_mode"] = "Browse Results"
+            st.session_state["pending_top_nav"] = "View Results"
             st.rerun()
 
     if not check_clicked and not run_clicked:
@@ -1044,9 +1044,6 @@ Possible causes to check:
 
 def render_view_results_tab() -> None:
     st.subheader("View Job Results")
-    if st.session_state.get("active_tab") == "view":
-        st.session_state["active_tab"] = "create"
-
     jobs = load_jobs_index()
 
     if not jobs:
@@ -1338,23 +1335,29 @@ def main() -> None:
         "Run and save outputs for multiple SQL queries per job using Azure SQL + Azure Active Directory Password authentication."
     )
 
-    active_tab = st.session_state.get("active_tab", "create")
-    if active_tab == "view":
-        view_tab, create_tab, connections_tab = st.tabs(
-            ["View Results", "Create Job", "DB Connections"]
-        )
-    else:
-        create_tab, view_tab, connections_tab = st.tabs(
-            ["Create Job", "View Results", "DB Connections"]
-        )
+    top_options = ["Create Job", "View Results", "DB Connections"]
+    pending_top_nav = st.session_state.pop("pending_top_nav", None)
+    if pending_top_nav in top_options:
+        st.session_state["active_top_nav"] = pending_top_nav
 
-    with create_tab:
+    if "active_top_nav" not in st.session_state:
+        st.session_state["active_top_nav"] = top_options[0]
+    if st.session_state["active_top_nav"] not in top_options:
+        st.session_state["active_top_nav"] = top_options[0]
+
+    selected_nav = st.radio(
+        "Navigation",
+        options=top_options,
+        horizontal=True,
+        key="active_top_nav",
+        label_visibility="collapsed",
+    )
+
+    if selected_nav == "Create Job":
         render_create_job_tab()
-
-    with view_tab:
+    elif selected_nav == "View Results":
         render_view_results_tab()
-
-    with connections_tab:
+    else:
         render_db_connections_tab()
 
 
