@@ -685,7 +685,9 @@ def utc_string_to_local_display(value: str) -> str:
         elif parsed.utcoffset() != timezone.utc.utcoffset(None):
             continue
 
-        return parsed.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+        local_dt = parsed.astimezone()
+        tz_symbol = local_dt.tzname() or "LOCAL"
+        return f"{local_dt.strftime('%Y-%m-%d %H:%M:%S')} {tz_symbol}"
 
     return value
 
