@@ -6,7 +6,8 @@ import re
 import socket
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, time as dt_time, timezone
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -64,6 +65,31 @@ def rows_to_dicts(headers: list[str], rows: list[tuple[Any, ...]]) -> list[dict[
     return records
 
 
+def to_json_safe(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+
+    if isinstance(value, (datetime, date, dt_time)):
+        return value.isoformat()
+
+    if isinstance(value, Decimal):
+        return float(value)
+
+    if isinstance(value, bytes):
+        return value.hex()
+
+    if isinstance(value, Path):
+        return str(value)
+
+    if isinstance(value, dict):
+        return {str(k): to_json_safe(v) for k, v in value.items()}
+
+    if isinstance(value, (list, tuple, set)):
+        return [to_json_safe(item) for item in value]
+
+    return str(value)
+
+
 def get_value_by_path(data: dict[str, Any], path: str) -> tuple[bool, Any]:
     current: Any = data
     for part in path.split("."):
@@ -79,6 +105,7 @@ def parse_query_block(raw_query: str, query_index: int) -> dict[str, Any]:
     name = f"q{query_index}"
     for_each: str | None = None
     item_alias = "item"
+    for_mode = "combine"
     body_start = 0
 
     for idx, line in enumerate(lines):
@@ -104,6 +131,10 @@ def parse_query_block(raw_query: str, query_index: int) -> dict[str, Any]:
             value = directive[5:].strip()
             if value:
                 item_alias = value
+        elif directive.startswith("for_mode "):
+            value = directive[9:].strip().lower()
+            if value in {"combine", "split"}:
+                for_mode = value
         body_start = idx + 1
 
     sql_text = "\n".join(lines[body_start:]).strip()
@@ -111,6 +142,7 @@ def parse_query_block(raw_query: str, query_index: int) -> dict[str, Any]:
         "name": name,
         "for_each": for_each,
         "item_alias": item_alias,
+        "for_mode": for_mode,
         "sql": sql_text,
         "raw": raw_query,
     }
@@ -352,10 +384,12 @@ def run_job(
                 "parameters": [],
                 "for_each": spec["for_each"],
                 "item_alias": spec["item_alias"],
+                "for_mode": spec["for_mode"],
                 "status": "success",
                 "row_count": 0,
                 "column_headers": [],
                 "output_file": None,
+                "loop_outputs": [],
                 "error": None,
             }
 
@@ -381,6 +415,7 @@ def run_job(
                         )
 
                     for item in iterable:
+                        loop_index = len(result["loop_outputs"]) + 1
                         loop_context = dict(context)
                         loop_context[spec["item_alias"]] = item
                         compiled_query, params, missing_vars = compile_query_template(
@@ -405,6 +440,19 @@ def run_job(
                                 headers = current_headers
                             rows = cursor.fetchall()
                             all_rows.extend(rows)
+
+                            if spec["for_mode"] == "split":
+                                split_file = job_dir / f"query_{i}_run_{loop_index}.csv"
+                                write_csv(split_file, current_headers, rows)
+                                result["loop_outputs"].append(
+                                    {
+                                        "run_index": loop_index,
+                                        "item": item,
+                                        "row_count": len(rows),
+                                        "output_file": str(split_file),
+                                        "parameters": params,
+                                    }
+                                )
                 else:
                     compiled_query, params, missing_vars = compile_query_template(spec["sql"], context)
                     if missing_vars:
@@ -426,12 +474,15 @@ def run_job(
                         all_rows.extend(rows)
 
                 if headers:
-                    output_file = job_dir / f"query_{i}.csv"
-                    write_csv(output_file, headers, all_rows)
-
                     result["row_count"] = len(all_rows)
                     result["column_headers"] = headers
-                    result["output_file"] = str(output_file)
+
+                    if spec["for_each"] and spec["for_mode"] == "split":
+                        result["output_file"] = None
+                    else:
+                        output_file = job_dir / f"query_{i}.csv"
+                        write_csv(output_file, headers, all_rows)
+                        result["output_file"] = str(output_file)
 
                     records = rows_to_dicts(headers, all_rows)
                     context["results"][spec["name"]] = records
@@ -465,7 +516,8 @@ def run_job(
         "results": results,
     }
 
-    (job_dir / "job.json").write_text(json.dumps(job_metadata, indent=2), encoding="utf-8")
+    safe_job_metadata = to_json_safe(job_metadata)
+    (job_dir / "job.json").write_text(json.dumps(safe_job_metadata, indent=2), encoding="utf-8")
 
     jobs_index = load_jobs_index()
     jobs_index.append(
@@ -482,7 +534,7 @@ def run_job(
     jobs_index.sort(key=lambda item: item["created_at"], reverse=True)
     save_jobs_index(jobs_index)
 
-    return job_metadata
+    return safe_job_metadata
 
 
 def load_job_metadata(job_id: str) -> dict[str, Any] | None:
@@ -544,7 +596,7 @@ def render_create_job_tab() -> None:
         st.markdown("### Example Usage")
         st.markdown("Use placeholders in SQL with the format `{{variable_name}}`.")
         st.markdown(
-            "Add optional directives at the top of each query block: `-- @name`, `-- @for_each`, `-- @item`."
+            "Add optional directives at the top of each query block: `-- @name`, `-- @for_each`, `-- @item`, `-- @for_mode`."
         )
         st.code(
             """-- @name users
@@ -555,6 +607,7 @@ WHERE TenantId = {{tenant_id}};
 -- @name orders_by_user
 -- @for_each users.rows
 -- @item user
+-- @for_mode split
 SELECT OrderId, UserId, Amount
 FROM dbo.Orders
 WHERE UserId = {{user.UserId}};""",
@@ -569,19 +622,92 @@ WHERE UserId = {{user.UserId}};""",
             language="json",
         )
         st.caption(
-            "Tip: `users.rows` is an array of objects from query `users`; each loop run appends to one combined result table."
+            "Tip: `for_mode` defaults to `combine`. Set `-- @for_mode split` to save one output file per loop run."
         )
 
     if "query_variables_builder" not in st.session_state:
         st.session_state["query_variables_builder"] = {}
     if "query_variables_raw_json" not in st.session_state:
         st.session_state["query_variables_raw_json"] = "{}"
+    if "variable_input_mode" not in st.session_state:
+        st.session_state["variable_input_mode"] = "Raw JSON"
+    if "create_job_name" not in st.session_state:
+        st.session_state["create_job_name"] = ""
+    if "create_job_queries" not in st.session_state:
+        st.session_state["create_job_queries"] = ""
+
+    st.markdown("#### Load From Previous Run")
+    previous_jobs = load_jobs_index()
+    if previous_jobs:
+        previous_job_options = {
+            f"{job['job_name']} | {job['created_at']} | {job['job_id']}": job["job_id"]
+            for job in previous_jobs
+        }
+        selected_previous_job_label = st.selectbox(
+            "Select Previous Run",
+            options=list(previous_job_options.keys()),
+            key="selected_previous_job_label",
+        )
+        if st.button("Auto Populate From Selected Run"):
+            selected_previous_job_id = previous_job_options[selected_previous_job_label]
+            previous_metadata = load_job_metadata(selected_previous_job_id)
+            if not previous_metadata:
+                st.error("Could not load metadata for selected run.")
+            else:
+                previous_results = sorted(
+                    previous_metadata.get("results", []),
+                    key=lambda item: item.get("query_index", 0),
+                )
+                previous_queries = [
+                    item.get("query", "") for item in previous_results if item.get("query")
+                ]
+                st.session_state["create_job_queries"] = "\n---\n".join(previous_queries)
+                st.session_state["create_job_name"] = (
+                    f"{previous_metadata.get('job_name', 'Job')} Copy"
+                )
+
+                previous_variables = previous_metadata.get("query_variables", {})
+                if isinstance(previous_variables, dict):
+                    st.session_state["query_variables_builder"] = previous_variables
+                    st.session_state["query_variables_raw_json"] = json.dumps(
+                        previous_variables, indent=2
+                    )
+                else:
+                    st.session_state["query_variables_builder"] = {}
+                    st.session_state["query_variables_raw_json"] = "{}"
+                st.session_state["variable_input_mode"] = "Raw JSON"
+
+                previous_connection = previous_metadata.get("azure_sql", {})
+                all_connections = load_db_connections()
+                matching_connection = next(
+                    (
+                        conn
+                        for conn in all_connections
+                        if normalize_server_name(conn.get("server", ""))
+                        == normalize_server_name(previous_connection.get("server", ""))
+                        and int(conn.get("port", 1433))
+                        == int(previous_connection.get("port", 1433))
+                        and conn.get("database", "") == previous_connection.get("database", "")
+                        and conn.get("username", "") == previous_connection.get("username", "")
+                    ),
+                    None,
+                )
+                if matching_connection:
+                    st.session_state["create_selected_connection_id"] = matching_connection[
+                        "connection_id"
+                    ]
+
+                st.success("Populated SQL queries and variables from previous run.")
+                st.rerun()
+    else:
+        st.caption("No previous runs available yet.")
 
     st.markdown("#### Query Variables")
     variable_input_mode = st.radio(
         "Variable Input Mode",
         options=["Raw JSON", "UI Builder"],
         horizontal=True,
+        key="variable_input_mode",
         help="Choose Raw JSON or add variables one-by-one using the UI Builder.",
     )
 
@@ -649,17 +775,24 @@ WHERE UserId = {{user.UserId}};""",
         return
 
     connection_options = {
-        (
+        conn["connection_id"]: (
             f"{conn['connection_name']} | {conn['server']}:{conn.get('port', 1433)} | "
             f"{conn['database']} | {conn['username']}"
-        ): conn["connection_id"]
+        )
         for conn in connections
     }
-    selected_connection_label = st.selectbox(
+    if "create_selected_connection_id" not in st.session_state:
+        st.session_state["create_selected_connection_id"] = next(iter(connection_options))
+
+    if st.session_state["create_selected_connection_id"] not in connection_options:
+        st.session_state["create_selected_connection_id"] = next(iter(connection_options))
+
+    selected_connection_id = st.selectbox(
         "Select DB Connection",
         options=list(connection_options.keys()),
+        format_func=lambda conn_id: connection_options[conn_id],
+        key="create_selected_connection_id",
     )
-    selected_connection_id = connection_options[selected_connection_label]
     selected_connection = next(
         (conn for conn in connections if conn["connection_id"] == selected_connection_id),
         None,
@@ -669,10 +802,13 @@ WHERE UserId = {{user.UserId}};""",
         return
 
     with st.form("create_job_form"):
-        job_name = st.text_input("Job Name", placeholder="Daily Sales Snapshot")
+        job_name = st.text_input(
+            "Job Name", placeholder="Daily Sales Snapshot", key="create_job_name"
+        )
         raw_queries = st.text_area(
             "SQL Queries",
             height=220,
+            key="create_job_queries",
             placeholder=(
                 "SELECT TOP 10 * FROM dbo.Customers;\n"
                 "---\n"
@@ -849,6 +985,10 @@ def render_view_results_tab() -> None:
             if query_result.get("parameters"):
                 st.write("Parameters")
                 st.json(query_result["parameters"])
+            if query_result.get("for_each"):
+                st.write(
+                    f"Loop Source: {query_result.get('for_each')} | Mode: {query_result.get('for_mode', 'combine')}"
+                )
 
             if query_result.get("error"):
                 st.error(query_result["error"])
@@ -868,6 +1008,38 @@ def render_view_results_tab() -> None:
                     )
                 else:
                     st.warning("Saved result file was not found on disk.")
+
+            loop_outputs = query_result.get("loop_outputs") or []
+            if loop_outputs:
+                st.write("Loop Outputs")
+                for loop_output in loop_outputs:
+                    loop_file = Path(loop_output["output_file"])
+                    st.markdown(
+                        f"**Run {loop_output['run_index']}** | Rows: {loop_output['row_count']}"
+                    )
+                    st.write("Loop Item")
+                    st.json(loop_output.get("item"))
+
+                    if loop_output.get("parameters"):
+                        st.write("Run Parameters")
+                        st.json(loop_output["parameters"])
+
+                    if loop_file.exists():
+                        headers, rows = read_csv_preview(loop_file)
+                        st.dataframe(rows_to_records(headers, rows), use_container_width=True)
+                        st.download_button(
+                            label=f"Download CSV for Run {loop_output['run_index']}",
+                            data=loop_file.read_bytes(),
+                            file_name=loop_file.name,
+                            mime="text/csv",
+                            key=(
+                                f"download_{query_result['query_index']}_{loop_output['run_index']}"
+                            ),
+                        )
+                    else:
+                        st.warning("Saved loop output file was not found on disk.")
+
+                    st.divider()
 
 
 def render_db_connections_tab() -> None:
