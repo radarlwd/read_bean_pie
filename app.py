@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import csv
+import io
 import json
 import re
 import shutil
 import socket
 import time
 import uuid
+import zipfile
 from datetime import date, datetime, time as dt_time, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -328,6 +330,25 @@ def save_db_connections(connections: list[dict[str, Any]]) -> None:
 
 def save_jobs_index(index_data: list[dict[str, Any]]) -> None:
     JOBS_INDEX_FILE.write_text(json.dumps(index_data, indent=2), encoding="utf-8")
+
+
+def sanitize_filename_component(value: str, fallback: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", value.strip()).strip("._-")
+    return cleaned or fallback
+
+
+def build_job_zip_bytes(job_id: str) -> bytes | None:
+    job_dir = JOBS_DIR / job_id
+    if not job_dir.exists() or not job_dir.is_dir():
+        return None
+
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for file_path in sorted(job_dir.rglob("*")):
+            if file_path.is_file():
+                archive.write(file_path, arcname=file_path.relative_to(job_dir).as_posix())
+
+    return buffer.getvalue()
 
 
 def delete_jobs(job_ids: list[str]) -> tuple[int, list[str]]:
@@ -1183,10 +1204,31 @@ def render_view_results_tab() -> None:
 
     st.write(f"**Job:** {metadata['job_name']}")
     st.write(f"**Created (Local):** {utc_string_to_local_display(str(metadata['created_at']))}")
-    st.write(f"**Server:** {metadata['azure_sql']['server']}")
-    st.write(f"**Port:** {metadata['azure_sql'].get('port', 1433)}")
-    st.write(f"**Database:** {metadata['azure_sql']['database']}")
-    st.write(f"**Auth:** {metadata['azure_sql']['authentication']}")
+    with st.expander("DB Connection Details", expanded=False):
+        st.write(f"**Server:** {metadata['azure_sql']['server']}")
+        st.write(f"**Port:** {metadata['azure_sql'].get('port', 1433)}")
+        st.write(f"**Database:** {metadata['azure_sql']['database']}")
+        st.write(f"**Auth:** {metadata['azure_sql']['authentication']}")
+
+    connection_name = str(metadata.get("azure_sql", {}).get("connection_name", "connection"))
+    timestamp_for_name = utc_string_to_local_display(str(metadata.get("created_at", "")))
+    zip_file_name = (
+        f"{sanitize_filename_component(str(metadata.get('job_name', 'job')), 'job')}"
+        f"__{sanitize_filename_component(connection_name, 'connection')}"
+        f"__{sanitize_filename_component(timestamp_for_name, 'timestamp')}.zip"
+    )
+    zip_bytes = build_job_zip_bytes(job_id)
+    if zip_bytes:
+        st.download_button(
+            label="Download All Query Files (ZIP)",
+            data=zip_bytes,
+            file_name=zip_file_name,
+            mime="application/zip",
+            key=f"download_job_zip_{job_id}",
+        )
+    else:
+        st.warning("Job files were not found on disk, so ZIP download is unavailable.")
+
     if metadata.get("query_variables"):
         st.write("**Query Variables:**")
         st.json(metadata["query_variables"])
