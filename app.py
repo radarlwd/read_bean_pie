@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import io
 import json
+import pandas as pd
 import re
 import shutil
 import socket
@@ -614,9 +615,9 @@ def read_csv_preview(file_path: Path, max_rows: int = 200) -> tuple[list[str], l
     return headers, rows
 
 
-def rows_to_records(headers: list[str], rows: list[list[str]]) -> list[dict[str, Any]]:
+def normalize_headers(headers: list[str]) -> list[str]:
     if not headers:
-        return [{"value": row} for row in rows]
+        return []
 
     normalized_headers: list[str] = []
     seen: dict[str, int] = {}
@@ -628,6 +629,15 @@ def rows_to_records(headers: list[str], rows: list[list[str]]) -> list[dict[str,
         else:
             seen[candidate] = 1
         normalized_headers.append(candidate)
+
+    return normalized_headers
+
+
+def rows_to_records(headers: list[str], rows: list[list[str]]) -> list[dict[str, Any]]:
+    if not headers:
+        return [{"value": row} for row in rows]
+
+    normalized_headers = normalize_headers(headers)
 
     records: list[dict[str, Any]] = []
     for row in rows:
@@ -690,6 +700,29 @@ def maybe_convert_utc_rows_to_local(rows: list[list[str]], convert_to_local: boo
     return converted_rows
 
 
+def build_display_rows_with_converted_flags(
+    rows: list[list[str]],
+    convert_to_local: bool,
+) -> tuple[list[list[str]], list[list[bool]]]:
+    if not convert_to_local:
+        return rows, [[False for _ in row] for row in rows]
+
+    display_rows: list[list[str]] = []
+    converted_flags: list[list[bool]] = []
+    for row in rows:
+        display_row: list[str] = []
+        row_flags: list[bool] = []
+        for cell in row:
+            original = str(cell)
+            converted = utc_string_to_local_display(original)
+            display_row.append(converted)
+            row_flags.append(converted != original)
+        display_rows.append(display_row)
+        converted_flags.append(row_flags)
+
+    return display_rows, converted_flags
+
+
 def render_searchable_result_table(
     headers: list[str],
     rows: list[list[str]],
@@ -698,12 +731,54 @@ def render_searchable_result_table(
     search_label: str,
     convert_utc_to_local: bool = False,
 ) -> None:
-    display_rows = maybe_convert_utc_rows_to_local(rows, convert_utc_to_local)
+    display_rows, converted_flags = build_display_rows_with_converted_flags(
+        rows, convert_utc_to_local
+    )
     search_text = st.text_input(search_label, key=f"{key_prefix}_search")
-    filtered_rows = filter_rows_by_search(display_rows, search_text)
+    query = search_text.strip().lower()
+    if query:
+        selected_indices = [
+            idx
+            for idx, row in enumerate(display_rows)
+            if any(query in str(cell).lower() for cell in row)
+        ]
+    else:
+        selected_indices = list(range(len(display_rows)))
+
+    filtered_rows = [display_rows[idx] for idx in selected_indices]
+    filtered_flags = [converted_flags[idx] for idx in selected_indices]
 
     st.caption(f"Showing {len(filtered_rows)} of {len(display_rows)} rows")
-    st.dataframe(rows_to_records(headers, filtered_rows), use_container_width=True)
+
+    records = rows_to_records(headers, filtered_rows)
+    frame = pd.DataFrame(records)
+
+    if frame.empty:
+        st.dataframe(frame, use_container_width=True)
+        return
+
+    if convert_utc_to_local and any(any(row) for row in filtered_flags):
+        normalized_headers = normalize_headers(headers)
+
+        def style_converted_cells(_: pd.DataFrame) -> pd.DataFrame:
+            styles = pd.DataFrame("", index=frame.index, columns=frame.columns)
+            for row_idx, row_flags in enumerate(filtered_flags):
+                for col_idx, is_converted in enumerate(row_flags):
+                    if not is_converted:
+                        continue
+                    if col_idx >= len(normalized_headers):
+                        continue
+                    col_name = normalized_headers[col_idx]
+                    if col_name in styles.columns:
+                        styles.at[row_idx, col_name] = (
+                            "background-color: #fff3cd; color: #7a4b00; font-weight: 600;"
+                        )
+            return styles
+
+        st.dataframe(frame.style.apply(style_converted_cells, axis=None), use_container_width=True)
+        return
+
+    st.dataframe(frame, use_container_width=True)
 
 
 def render_create_job_tab() -> None:
