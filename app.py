@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import json
 import re
+import shutil
 import socket
 import time
 import uuid
@@ -327,6 +328,35 @@ def save_db_connections(connections: list[dict[str, Any]]) -> None:
 
 def save_jobs_index(index_data: list[dict[str, Any]]) -> None:
     JOBS_INDEX_FILE.write_text(json.dumps(index_data, indent=2), encoding="utf-8")
+
+
+def delete_jobs(job_ids: list[str]) -> tuple[int, list[str]]:
+    ensure_storage()
+    requested_ids = {job_id for job_id in job_ids if job_id}
+    if not requested_ids:
+        return 0, []
+
+    delete_errors: list[str] = []
+    deleted_ids: set[str] = set()
+
+    for job_id in requested_ids:
+        job_dir = JOBS_DIR / job_id
+        if not job_dir.exists():
+            deleted_ids.add(job_id)
+            continue
+
+        try:
+            shutil.rmtree(job_dir)
+            deleted_ids.add(job_id)
+        except OSError as exc:
+            delete_errors.append(f"{job_id}: {exc}")
+
+    jobs_index = load_jobs_index()
+    kept_jobs = [job for job in jobs_index if str(job.get("job_id")) not in deleted_ids]
+    deleted_count = len(jobs_index) - len(kept_jobs)
+    save_jobs_index(kept_jobs)
+
+    return deleted_count, delete_errors
 
 
 def write_csv(file_path: Path, headers: list[str], rows: list[tuple[Any, ...]]) -> None:
@@ -1031,6 +1061,46 @@ def render_view_results_tab() -> None:
         ): job["job_id"]
         for job in jobs
     }
+
+    view_mode = st.radio(
+        "Results Action",
+        options=["Browse Results", "Delete Results"],
+        index=0,
+        horizontal=True,
+        key="view_results_mode",
+    )
+
+    if view_mode == "Delete Results":
+        st.markdown("### Delete Results")
+        delete_selection = st.multiselect(
+            "Select Results to Delete",
+            options=list(labels.keys()),
+            key="view_results_delete_selection",
+        )
+        delete_confirmed = st.checkbox(
+            "I understand selected results will be permanently deleted",
+            value=False,
+            key="view_results_delete_confirm",
+        )
+        if st.button("Delete Selected Results", type="secondary"):
+            if not delete_selection:
+                st.warning("Select at least one result to delete.")
+            elif not delete_confirmed:
+                st.warning("Confirm deletion before deleting results.")
+            else:
+                deleted_count, delete_errors = delete_jobs([labels[item] for item in delete_selection])
+                if delete_errors:
+                    st.error("Some results could not be deleted:")
+                    for err in delete_errors:
+                        st.write(f"- {err}")
+                if deleted_count > 0:
+                    st.success(f"Deleted {deleted_count} result(s).")
+                    st.rerun()
+                if deleted_count == 0 and not delete_errors:
+                    st.info("No results were deleted.")
+        return
+
+    st.markdown("### Browse Results")
     selected_label = st.selectbox("Select Job", options=list(labels.keys()))
     job_id = labels[selected_label]
 
